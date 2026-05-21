@@ -1,4 +1,5 @@
 import { HeliusTransaction, HeliusTokenMetadata } from '@/types';
+import { pickMigrationMint } from '@/lib/pumpfun';
 
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY!;
 const HELIUS_RPC_URL = process.env.HELIUS_RPC_URL!;
@@ -53,6 +54,35 @@ export async function getTransactionsBySignatures(
 
   return res.json();
 }
+
+export async function getTokenCreator(mint: string): Promise<string | null> {
+  try {
+    const res = await fetch(HELIUS_RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'creator',
+        method: 'getAsset',
+        params: { id: mint },
+      }),
+    });
+    const json = await res.json();
+    const asset = json?.result;
+    if (!asset) return null;
+
+    const creators = asset?.creators;
+    if (Array.isArray(creators) && creators.length > 0) {
+      const c = creators.find((x: any) => x.verified) || creators[0];
+      if (c?.address) return c.address;
+    }
+    const authority = asset?.authorities?.find((a: any) => a.scopes?.includes('full'));
+    if (authority?.address) return authority.address;
+    return asset?.ownership?.owner || null;
+  } catch {
+    return null;
+  }
+} 
 
 // Token metadata via Helius DAS API
 export async function getTokenMetadata(mints: string[]): Promise<HeliusTokenMetadata[]> {
@@ -146,37 +176,43 @@ export async function getRecentMigrations(limit = 20): Promise<{
   slot: number;
 }[]> {
   const MIGRATION_PROGRAM = process.env.PUMPFUN_MIGRATION_PROGRAM!;
-  
+
   try {
     const sigs = await getSignaturesForAddress(MIGRATION_PROGRAM, limit);
-    const txSigs = sigs.map(s => s.signature);
-    
+    const txSigs = sigs.map((s: any) => s.signature);
     if (txSigs.length === 0) return [];
-    
+
     const txs = await getTransactionsBySignatures(txSigs);
-    
     const migrations: { signature: string; mint: string; timestamp: number; slot: number }[] = [];
-    
+
     for (let i = 0; i < txs.length; i++) {
       const tx = txs[i];
-      // Find the new token mint from token transfers
-      const mints = new Set(tx.tokenTransfers?.map((t: any) => t.mint).filter(Boolean));
-      
-      for (const mint of mints) {
-        migrations.push({
-          signature: tx.signature,
-          mint: mint as string,
-          timestamp: tx.timestamp,
-          slot: sigs[i]?.slot || 0,
-        });
-      }
+      // pickMigrationMint filters out WSOL, USDC, USDT automatically
+      const mint = pickMigrationMint(tx.tokenTransfers);
+      if (!mint) continue;
+
+      migrations.push({
+        signature: tx.signature,
+        mint,
+        timestamp: tx.timestamp,
+        slot: sigs[i]?.slot || 0,
+      });
     }
-    
-    return migrations;
+
+    return dedupeMigrationsByMint(migrations).slice(0, limit);
   } catch (error) {
     console.error('Error fetching migrations:', error);
     return [];
   }
+}
+
+function dedupeMigrationsByMint<T extends { mint: string; timestamp: number }>(items: T[]): T[] {
+  const byMint = new Map<string, T>();
+  for (const m of items) {
+    const prev = byMint.get(m.mint);
+    if (!prev || m.timestamp > prev.timestamp) byMint.set(m.mint, m);
+  }
+  return Array.from(byMint.values()).sort((a, b) => b.timestamp - a.timestamp);
 }
 
 // Fetch all trades for a specific token mint
