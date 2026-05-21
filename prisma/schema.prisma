@@ -1,0 +1,111 @@
+// This is your Prisma schema file
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model MigratedCoin {
+  id              String   @id @default(cuid())
+  mint            String   @unique
+  name            String?
+  symbol          String?
+  migrationTxSig  String?
+  migratedAt      DateTime
+  marketCapAtMigration Float?
+  currentMarketCap     Float?
+  raydiumPoolId   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  trades          Trade[]
+  earlyBuyers     EarlyBuyer[]
+
+  @@index([migratedAt])
+  @@index([mint])
+}
+
+model Trade {
+  id          String   @id @default(cuid())
+  mint        String
+  wallet      String
+  type        TradeType
+  solAmount   Float
+  tokenAmount Float
+  priceUsd    Float?
+  signature   String   @unique
+  timestamp   DateTime
+  slot        BigInt?
+  createdAt   DateTime @default(now())
+
+  coin        MigratedCoin @relation(fields: [mint], references: [mint])
+  wallet_ref  Wallet?      @relation(fields: [wallet], references: [address])
+
+  @@index([mint])
+  @@index([wallet])
+  @@index([timestamp])
+}
+
+model EarlyBuyer {
+  id            String   @id @default(cuid())
+  mint          String
+  wallet        String
+  buyAmountSol  Float
+  buyAmountUsd  Float?
+  marketCapAtBuy Float?
+  isEarly       Boolean  @default(false)  // bought < 15k mcap
+  rank          Int?     // buy order rank
+  createdAt     DateTime @default(now())
+
+  coin          MigratedCoin @relation(fields: [mint], references: [mint])
+  wallet_ref    Wallet       @relation(fields: [wallet], references: [address])
+
+  @@unique([mint, wallet])
+  @@index([mint])
+  @@index([wallet])
+}
+
+model Wallet {
+  id              String   @id @default(cuid())
+  address         String   @unique
+  score           Float    @default(0)
+  tier            WalletTier @default(UNKNOWN)
+  
+  // Score breakdown
+  earlyBuyCount   Int      @default(0)
+  winRate         Float    @default(0)
+  avgMultiple     Float    @default(0)
+  totalPnlSol     Float    @default(0)
+  rugCount        Int      @default(0)
+  
+  // Meta
+  firstSeen       DateTime?
+  lastActive      DateTime?
+  totalTrades     Int      @default(0)
+  labelled        String?  // "insider", "sniper", "bot", etc
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  trades          Trade[]
+  earlyBuys       EarlyBuyer[]
+
+  @@index([score])
+  @@index([tier])
+}
+
+enum TradeType {
+  BUY
+  SELL
+}
+
+enum WalletTier {
+  ELITE      // score >= 80
+  SMART      // score 60-79
+  AVERAGE    // score 40-59
+  POOR       // score 20-39
+  UNKNOWN    // not scored yet
+}
