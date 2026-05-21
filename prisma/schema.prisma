@@ -13,6 +13,7 @@ model MigratedCoin {
   mint            String   @unique
   name            String?
   symbol          String?
+  image           String?
   migrationTxSig  String?
   migratedAt      DateTime
   marketCapAtMigration Float?

@@ -78,17 +78,33 @@ function CoinRow({
         isSelected ? 'bg-accent/5 border-l-2 border-l-accent' : 'border-l-2 border-l-transparent'
       }`}
     >
+      {/* 🟢 Restored outer structure wrapper */}
       <div className="flex items-center justify-between">
+        
+        {/* Left column items */}
         <div className="flex items-center gap-2 min-w-0">
-          {/* Symbol badge */}
-          <div className="w-8 h-8 rounded-lg bg-border/50 flex items-center justify-center flex-shrink-0 text-xs font-bold text-accent group-hover:bg-accent/10 transition-colors">
-            {(coin.symbol || '??').slice(0, 3).toUpperCase()}
+          <div className="w-8 h-8 rounded-lg bg-border/50 overflow-hidden flex items-center justify-center flex-shrink-0 text-xs font-bold text-accent group-hover:bg-accent/10 transition-colors">
+            {coin.image ? (
+              <img 
+                src={coin.image} 
+                alt={coin.symbol || 'token'} 
+                className="w-full h-full object-cover"
+                onError={(e) => {
+                  (e.target as HTMLImageElement).style.display = 'none';
+                }}
+              />
+            ) : (
+              (coin.symbol || '??').slice(0, 3).toUpperCase()
+            )}
           </div>
+          
           <div className="min-w-0">
             <p className="text-sm font-medium truncate">{coin.name || 'Unknown'}</p>
             <p className="mono text-[10px] text-muted">{coin.mint.slice(0, 8)}...{coin.mint.slice(-4)}</p>
           </div>
         </div>
+
+        {/* Right column items */}
         <div className="text-right flex-shrink-0 ml-2">
           <p className="mono text-[10px] text-muted">{timeAgo}</p>
           {coin.earlyBuyerCount !== undefined && (
@@ -97,6 +113,7 @@ function CoinRow({
             </p>
           )}
         </div>
+
       </div>
     </button>
   );

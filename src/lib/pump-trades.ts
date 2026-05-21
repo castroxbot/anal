@@ -97,7 +97,7 @@ export function parseBuysFromParsedTx(
     seen.add(key);
 
     let solAmount = solDeltaForOwner(tx, owner);
-    if (solAmount < 0.000_001) {
+    if (solAmount < 0.5) {
       const feePayer = getAccountKeys(tx)[0];
       if (feePayer === owner) solAmount = solDeltaForOwner(tx, feePayer);
     }

@@ -3,6 +3,7 @@ export interface MigratedCoin {
   mint: string;
   name: string | null;
   symbol: string | null;
+  image: string | null;
   migrationTxSig: string | null;
   migratedAt: string;
   marketCapAtMigration: number | null;
