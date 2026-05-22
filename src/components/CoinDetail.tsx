@@ -220,6 +220,7 @@ function EarlyBuyersTable({
           <th>WALLET</th>
           <th>SOL SPENT</th>
           <th>MCAP AT BUY</th>
+          <th>PROFIT (PnL)</th> {/* 🟢 Added header */}
           <th>SCORE</th>
           <th>TIER</th>
           <th>LABEL</th>
@@ -244,6 +245,18 @@ function EarlyBuyersTable({
                 ? `$${buyer.marketCapAtBuy.toLocaleString(undefined, { maximumFractionDigits: 0 })}`
                 : '—'}
             </td>
+
+            {/* 🟢 FIXED: Inserted the Profit & Loss visualization cell here to align table data columns */}
+            <td className="mono text-xs font-semibold">
+              {(buyer as any).hasSold ? (
+                <span className={(buyer as any).realizedPnlSol >= 0 ? 'text-accent' : 'text-accent2'}>
+                  {(buyer as any).realizedPnlSol >= 0 ? '+' : ''}◎{(buyer as any).realizedPnlSol.toFixed(2)}
+                </span>
+              ) : (
+                <span className="text-muted/60">Riding 💎</span>
+              )}
+            </td>
+
             <td>
               {buyer.walletScore !== undefined && buyer.walletScore > 0 ? (
                 <ScoreBar score={buyer.walletScore} />

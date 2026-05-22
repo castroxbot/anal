@@ -59,7 +59,8 @@ function solDeltaForOwner(tx: ParsedTransactionWithMeta, owner: string): number 
 }
 
 /** Parse buys from RPC pre/post token balances */
-export function parseBuysFromParsedTx(
+// 🟢 Replace parseBuysFromParsedTx with this:
+export function parseTradesFromParsedTx(
   tx: ParsedTransactionWithMeta | null,
   mint: string,
   bondingCurve: string
@@ -76,7 +77,7 @@ export function parseBuysFromParsedTx(
 
   const pre = tx.meta.preTokenBalances || [];
   const post = tx.meta.postTokenBalances || [];
-  const buys: ParsedPumpTrade[] = [];
+  const trades: ParsedPumpTrade[] = [];
   const seen = new Set<string>();
 
   for (const postBal of post) {
@@ -90,9 +91,10 @@ export function parseBuysFromParsedTx(
     const postAmt = postBal.uiTokenAmount?.uiAmount ?? 0;
     const delta = (postAmt ?? 0) - (preAmt ?? 0);
 
-    if (delta <= 1e-12) continue;
+    if (Math.abs(delta) <= 1e-12) continue;
 
-    const key = `${signature}:${owner}`;
+    const type = delta > 0 ? 'BUY' : 'SELL';
+    const key = `${signature}:${owner}:${type}`;
     if (seen.has(key)) continue;
     seen.add(key);
 
@@ -104,17 +106,17 @@ export function parseBuysFromParsedTx(
 
     if (solAmount < MIN_BUY_SOL) continue;
 
-    buys.push({
+    trades.push({
       wallet: owner,
-      type: 'BUY',
+      type,
       solAmount,
-      tokenAmount: delta,
+      tokenAmount: Math.abs(delta),
       signature,
       timestamp,
     });
   }
 
-  return buys;
+  return trades;
 }
 
 /** Paginate bonding-curve signatures until migration (newest pages → oldest) */
@@ -169,6 +171,7 @@ async function collectPreMigrationSignatures(
  * Fetch all bonding-curve BUYs until market cap crosses $15k (early-buyer phase only).
  * Stops parsing once the curve passes the threshold — no need for later trades.
  */
+// 🟢 Update fetchEarlyBondingCurveBuys to look like this:
 export async function fetchEarlyBondingCurveBuys(
   mint: string,
   solPriceUsd: number,
@@ -178,53 +181,67 @@ export async function fetchEarlyBondingCurveBuys(
   const bondingCurveStr = bondingCurve.toBase58();
   const conn = getConnection();
 
-  const signatures = await collectPreMigrationSignatures(
-    bondingCurve,
-    options.migratedAt
-  );
-
+  const signatures = await collectPreMigrationSignatures(bondingCurve, options.migratedAt);
   if (signatures.length === 0) return [];
 
   let virtualSol = INITIAL_VIRTUAL_SOL_LAMPORTS;
   let virtualToken = INITIAL_VIRTUAL_TOKEN_RAW;
-  const earlyBuys: ParsedPumpTrade[] = [];
+  const allCurveTrades: ParsedPumpTrade[] = [];
 
-  for (const sigInfo of signatures) {
-    const mcapNow = marketCapUsdFromReserves(virtualSol, virtualToken, solPriceUsd);
-    if (mcapNow >= EARLY_BUY_THRESHOLD_USD) break;
-
-    let tx: ParsedTransactionWithMeta | null = null;
+  const CHUNK_SIZE = 20; // Lowered to 20 to prevent payload size and timeout rejections
+  for (let i = 0; i < signatures.length; i += CHUNK_SIZE) {
+    const chunkSigs = signatures.slice(i, i + CHUNK_SIZE).map(s => s.signature);
+    
+    let txs: (any | null)[] = [];
     try {
-      tx = await conn.getParsedTransaction(sigInfo.signature, {
+      txs = await conn.getParsedTransactions(chunkSigs, {
         maxSupportedTransactionVersion: 0,
         commitment: 'confirmed',
       });
-    } catch {
-      await new Promise(r => setTimeout(r, TX_DELAY_MS));
-      continue;
-    }
-
-    const buys = parseBuysFromParsedTx(tx, mint, bondingCurveStr);
-    for (const buy of buys) {
-      const mcapAtBuy = marketCapUsdFromReserves(virtualSol, virtualToken, solPriceUsd);
-
-      if (mcapAtBuy < EARLY_BUY_THRESHOLD_USD) {
-        earlyBuys.push(buy);
-      }
-
-      const state = applyBuyToReservesState(virtualSol, virtualToken, buy);
-      virtualSol = state.virtualSolLamports;
-      virtualToken = state.virtualTokenRaw;
-
-      if (marketCapUsdFromReserves(virtualSol, virtualToken, solPriceUsd) >= EARLY_BUY_THRESHOLD_USD) {
-        break;
+    } catch (err) {
+      console.warn(`Batch fetch failed for ${chunkSigs.length} txs, falling back with request delays...`);
+      for (const sig of chunkSigs) {
+        try {
+          const singleTx = await conn.getParsedTransaction(sig, {
+            maxSupportedTransactionVersion: 0,
+            commitment: 'confirmed',
+          });
+          txs.push(singleTx);
+          // 🟢 Added line: Small delay during fallback to respect RPC limits
+          await new Promise(r => setTimeout(r, 60)); 
+        } catch {
+          txs.push(null);
+        }
       }
     }
 
-    await new Promise(r => setTimeout(r, TX_DELAY_MS));
+    for (const tx of txs) {
+      if (!tx) continue;
+      const txTrades = parseTradesFromParsedTx(tx, mint, bondingCurveStr);
+      for (const trade of txTrades) {
+        const mcapAtTrade = marketCapUsdFromReserves(virtualSol, virtualToken, solPriceUsd);
+        (trade as any).mcapAtTrade = mcapAtTrade; 
+
+        allCurveTrades.push(trade);
+
+        const solLamports = BigInt(Math.round(trade.solAmount * 1e9));
+        const tokensRaw = BigInt(Math.round(trade.tokenAmount * 1e6));
+
+        if (trade.type === 'BUY') {
+          virtualSol += solLamports;
+          virtualToken -= tokensRaw;
+        } else {
+          virtualSol -= solLamports;
+          virtualToken += tokensRaw;
+        }
+      }
+    }
+
+    // 🟢 Keep or adjust the cooling delay between chunk payloads
+    await new Promise(r => setTimeout(r, 200));
   }
 
-  return earlyBuys;
+  return allCurveTrades;
 }
 
 /** @deprecated Use fetchEarlyBondingCurveBuys for early-buyer analysis */

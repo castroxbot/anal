@@ -41,6 +41,52 @@ export async function GET(
       });
     }
 
+    const cachedEarlyBuyers = await db.earlyBuyer.findMany({
+      where: { mint, isEarly: true },
+      orderBy: { rank: 'asc' },
+      include: { wallet_ref: true },
+    });
+
+    if (cachedEarlyBuyers.length > 0) {
+      const creatorWallet = await getTokenCreator(mint).catch(() => null);
+      const filteredEarly = cachedEarlyBuyers.filter(eb => eb.buyAmountSol >= MIN_BUY_SOL);
+      const uniqueBuyers = new Set(filteredEarly.map(eb => eb.wallet)).size;
+      const avgBuySol = filteredEarly.length > 0
+        ? filteredEarly.reduce((s, eb) => s + eb.buyAmountSol, 0) / filteredEarly.length
+        : 0;
+
+      return NextResponse.json({
+        coin: {
+          ...coin,
+          migratedAt: coin.migratedAt.toISOString(),
+          createdAt: coin.createdAt.toISOString(),
+          updatedAt: coin.updatedAt.toISOString(),
+          creatorWallet,
+        },
+        trades: [],
+        earlyBuyers: filteredEarly.map((eb: any) => ({
+          ...eb,
+          createdAt: eb.createdAt.toISOString(),
+          lastSoldAt: eb.lastSoldAt ? eb.lastSoldAt.toISOString() : null,
+          realizedPnlSol: eb.realizedPnlSol,
+          hasSold: eb.hasSold,
+          soldAmountSol: eb.soldAmountSol,
+          walletScore: eb.wallet_ref?.score || 0,
+          walletTier: eb.wallet_ref?.tier || 'UNKNOWN',
+          labelled: eb.wallet_ref?.labelled,
+          isDev: isDevWallet(eb.wallet, creatorWallet),
+        })),
+        stats: {
+          totalBuys: filteredEarly.length,
+          totalSells: 0,
+          uniqueBuyers,
+          earlyBuyerCount: filteredEarly.length,
+          avgBuySol,
+          txsParsed: cachedEarlyBuyers.length,
+        },
+      });
+    }
+
     const solPrice = await getSolPrice();
     const creatorWallet = await getTokenCreator(mint);
 
@@ -64,7 +110,6 @@ export async function GET(
     await db.trade.deleteMany({ where: { mint } });
     await db.earlyBuyer.deleteMany({ where: { mint } });
 
-    const savedBuys = [];
     for (const trade of buyTrades) {
       try {
         await db.wallet.upsert({
@@ -72,11 +117,12 @@ export async function GET(
           create: { address: trade.wallet },
           update: { lastActive: new Date(trade.timestamp) },
         });
-        const saved = await db.trade.create({
+        
+        await (db.trade.create as any)({
           data: {
             mint,
             wallet: trade.wallet,
-            type: 'BUY',
+            type: trade.type, 
             solAmount: trade.solAmount,
             tokenAmount: trade.tokenAmount,
             priceUsd: trade.solAmount > 0 ? trade.solAmount * solPrice : null,
@@ -84,24 +130,15 @@ export async function GET(
             timestamp: new Date(trade.timestamp),
           },
         });
-        savedBuys.push(saved);
       } catch {
         // skip duplicate signature
       }
     }
 
-    const earlyBuyers = detectEarlyBuyers(
-      savedBuys.map(t => ({
-        wallet: t.wallet,
-        solAmount: t.solAmount,
-        tokenAmount: t.tokenAmount,
-        timestamp: t.timestamp,
-      })),
-      solPrice
-    );
+    const earlyBuyers = detectEarlyBuyers(buyTrades, solPrice);
 
     for (const eb of earlyBuyers) {
-      await db.earlyBuyer.upsert({
+      await (db.earlyBuyer.upsert as any)({
         where: { mint_wallet: { mint, wallet: eb.wallet } },
         create: {
           mint,
@@ -111,8 +148,19 @@ export async function GET(
           marketCapAtBuy: eb.marketCapAtBuy,
           isEarly: true,
           rank: eb.rank,
+          soldAmountSol: eb.soldAmountSol,
+          realizedPnlSol: eb.realizedPnlSol,
+          hasSold: eb.hasSold,
+          lastSoldAt: eb.lastSoldAt,
         },
-        update: { rank: eb.rank, marketCapAtBuy: eb.marketCapAtBuy },
+        update: { 
+          rank: eb.rank, 
+          marketCapAtBuy: eb.marketCapAtBuy,
+          soldAmountSol: eb.soldAmountSol,
+          realizedPnlSol: eb.realizedPnlSol,
+          hasSold: eb.hasSold,
+          lastSoldAt: eb.lastSoldAt,
+        },
       });
     }
 
@@ -137,9 +185,13 @@ export async function GET(
         creatorWallet,
       },
       trades: [],
-      earlyBuyers: filteredEarly.map(eb => ({
+      earlyBuyers: filteredEarly.map((eb: any) => ({
         ...eb,
         createdAt: eb.createdAt.toISOString(),
+        lastSoldAt: eb.lastSoldAt ? eb.lastSoldAt.toISOString() : null,
+        realizedPnlSol: eb.realizedPnlSol, 
+        hasSold: eb.hasSold,               
+        soldAmountSol: eb.soldAmountSol,   
         walletScore: eb.wallet_ref?.score || 0,
         walletTier: eb.wallet_ref?.tier || 'UNKNOWN',
         labelled: eb.wallet_ref?.labelled,

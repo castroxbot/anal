@@ -84,26 +84,34 @@ export async function GET(req: NextRequest) {
 
     // 3. Get metadata for mints
     const uniqueMints = migrations.map(m => m.mint).filter((value, index, self) => self.indexOf(value) === index);
-    let metadataMap: Record<string, { name: string; symbol: string; image: string | null }> = {};
+    let metadataMap: Record<string, { name: string; symbol: string; image: string | null; isMayhem: boolean }> = {};
 
     try {
       const metadata = await getTokenMetadata(uniqueMints);
       for (const m of metadata) {
-        // 🟢 Extract and assign image from Helius asset properties
-        metadataMap[m.mint] = { name: m.name, symbol: m.symbol, image: m.image || null };
+        metadataMap[m.mint] = { 
+          name: m.name, 
+          symbol: m.symbol, 
+          image: m.image || null, 
+          isMayhem: (m as any).isMayhem 
+        };
       }
     } catch (err) {
       console.warn('Metadata fetch failed:', err);
-    }
+    } // 🟢 Fixed: Closed the inner try-catch block properly
 
     // 4. Upsert to DB
     const coins = [];
     for (const migration of migrations) {
-      // 🟢 Add image to fallback defaults
-      const meta = metadataMap[migration.mint] || { name: 'Unknown', symbol: '???', image: null };
+      const meta = metadataMap[migration.mint] || { name: 'Unknown', symbol: '???', image: null, isMayhem: false };
+
+      // 🟢 Updated: Actively delete the coin from the database if it's a Mayhem token
+      if (meta.isMayhem) {
+        await (db.migratedCoin.delete as any)({ where: { mint: migration.mint } }).catch(() => {});
+        continue; 
+      }
 
       try {
-        // 🟢 Cast upsert to any to bypass stale local client types
         const coin = await (db.migratedCoin.upsert as any)({
           where: { mint: migration.mint },
           create: {

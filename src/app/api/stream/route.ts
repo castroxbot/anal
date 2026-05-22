@@ -1,3 +1,4 @@
+import Client from '@triton-one/yellowstone-grpc';
 import { NextRequest } from 'next/server';
 import { getRecentMigrations, getTokenMetadata, getSolPrice } from '@/lib/helius';
 import { fetchEarlyBondingCurveBuys } from '@/lib/pump-trades';
@@ -25,235 +26,261 @@ export function broadcastSSE(message: SSEMessage): void {
 }
 
 // Poll for new migrations in background
-let pollingInterval: NodeJS.Timeout | null = null;
+let isGrpcActive = false;
 let lastSeenSignatures = new Set<string>();
 
-function startPolling() {
-  if (pollingInterval) return;
+async function startGrpcStream() {
+  if (isGrpcActive) return;
+  isGrpcActive = true;
 
-  pollingInterval = setInterval(async () => {
-    if (clients.size === 0) return; // No clients, skip
+  // Establish a connection with the PublicNode Yellowstone gRPC plugin
+  const client = new Client("solana-yellowstone-grpc.publicnode.com:443", undefined, {});
+  const stream = await client.subscribe();
+
+  const request = {
+    transactions: {
+      migrationFilter: {
+        accountInclude: ["39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg"], // PumpFun Migration Program
+        accountExclude: [],
+        accountRequired: []
+      }
+    },
+    slots: {},
+    accounts: {},
+    blocks: {},
+    blocksMeta: {},
+    entry: {},
+  };
+
+  await stream.write(request);
+  console.log("[gRPC] Successfully subscribed to live PumpFun migrations.");
+
+  stream.on("data", async (packet) => {
+    // Skip if no active UI clients are connected to save compute resources
+    if (clients.size === 0 || !packet.transaction) return;
 
     try {
-      const migrations = await getRecentMigrations(10);
+      // Triggered instantly! Fetch perfectly parsed migration elements via Helius records
+      const migrations = await getRecentMigrations(5);
       const newMigrations = migrations.filter(m => !lastSeenSignatures.has(m.signature));
 
-      if (newMigrations.length > 0) {
-        // Fetch metadata for new mints
-        const mints = newMigrations.map(m => m.mint);
-        let metadataMap: Record<string, { name: string; symbol: string; image: string | null }> = {};
+      if (newMigrations.length === 0) return;
+
+      // Fetch metadata for new mints
+      const mints = newMigrations.map(m => m.mint);
+      let metadataMap: Record<string, { name: string; symbol: string; image: string | null; isMayhem: boolean }> = {};
+      
+      try {
+        const metadata = await getTokenMetadata(mints);
+        for (let i = 0; i < metadata.length; i++) {
+          const m = metadata[i];
+          metadataMap[m.mint] = { 
+            name: m.name, 
+            symbol: m.symbol, 
+            image: m.image || null,
+            isMayhem: (m as any).isMayhem
+          };
+        }
+      } catch (metaErr) {
+        console.error('Metadata fetch failed:', metaErr);
+      }
+
+      const solPrice = await getSolPrice();
+
+      for (let i = 0; i < newMigrations.length; i++) {
+        const migration = newMigrations[i];
+        const meta = metadataMap[migration.mint] || { name: 'Unknown', symbol: '???', image: null, isMayhem: false };
         
-        try {
-          const metadata = await getTokenMetadata(mints);
-          for (let i = 0; i < metadata.length; i++) {
-            const m = metadata[i];
-            metadataMap[m.mint] = { 
-              name: m.name, 
-              symbol: m.symbol, 
-              image: m.image || null 
-            };
-          }
-        } catch (metaErr) {
-          console.error('Metadata fetch failed:', metaErr);
+        if (meta.isMayhem) {
+          await (prisma.migratedCoin.delete as any)({ where: { mint: migration.mint } }).catch(() => {});
+          continue; 
         }
 
-        const solPrice = await getSolPrice();
+        const migrationDate = new Date(migration.timestamp * 1000);
 
-        for (let i = 0; i < newMigrations.length; i++) {
-          const migration = newMigrations[i];
-          const meta = metadataMap[migration.mint] || { name: 'Unknown', symbol: '???', image: null };
-          const migrationDate = new Date(migration.timestamp * 1000);
+        await (prisma.migratedCoin.upsert as any)({
+          where: { mint: migration.mint },
+          update: {
+            name: meta.name,
+            symbol: meta.symbol,
+            image: meta.image,
+            migrationTxSig: migration.signature,
+            migratedAt: migrationDate,
+          },
+          create: {
+            mint: migration.mint,
+            name: meta.name,
+            symbol: meta.symbol,
+            image: meta.image,
+            migrationTxSig: migration.signature,
+            migratedAt: migrationDate,
+          },
+        });
 
-          // 1. Automatically save/cache Migrated Coin with its Image (Typecast to bypass stale prisma clients safely)
-          await (prisma.migratedCoin.upsert as any)({
-            where: { mint: migration.mint },
+        console.log(`[gRPC-Bot] Pre-fetching early buyers for mint: ${migration.mint}`);
+        const earlyCurveBuys = await fetchEarlyBondingCurveBuys(migration.mint, solPrice, {
+          migratedAt: migrationDate,
+        });
+
+        const uniqueWallets = new Set<string>();
+
+        for (let j = 0; j < earlyCurveBuys.length; j++) {
+          const buy = earlyCurveBuys[j];
+          uniqueWallets.add(buy.wallet);
+
+          await prisma.wallet.upsert({
+            where: { address: buy.wallet },
+            update: {},
+            create: {
+              address: buy.wallet,
+              score: 0,
+              tier: 'UNKNOWN',
+            },
+          });
+
+          await (prisma.trade.upsert as any)({
+            where: { signature: buy.signature },
+            update: {},
+            create: {
+              mint: migration.mint,
+              wallet: buy.wallet,
+              type: buy.type, // Custom multi-trade parsing field support
+              solAmount: buy.solAmount,
+              tokenAmount: buy.tokenAmount,
+              signature: buy.signature,
+              timestamp: new Date(buy.timestamp),
+            },
+          });
+
+          await (prisma.earlyBuyer.upsert as any)({
+            where: {
+              mint_wallet: {
+                mint: migration.mint,
+                wallet: buy.wallet,
+              },
+            },
             update: {
-              name: meta.name,
-              symbol: meta.symbol,
-              image: meta.image,
-              migrationTxSig: migration.signature,
-              migratedAt: migrationDate,
+              isEarly: true,
+              buyAmountSol: buy.solAmount,
             },
             create: {
               mint: migration.mint,
-              name: meta.name,
-              symbol: meta.symbol,
-              image: meta.image,
-              migrationTxSig: migration.signature,
-              migratedAt: migrationDate,
+              wallet: buy.wallet,
+              buyAmountSol: buy.solAmount,
+              buyAmountUsd: buy.solAmount * solPrice,
+              isEarly: true,
             },
           });
+        }
 
-          // 2. Automatically pre-fetch early buyers immediately before UI interaction
-          console.log(`[Auto-Bot] Fetching early buyers for mint: ${migration.mint}`);
-          const earlyCurveBuys = await fetchEarlyBondingCurveBuys(migration.mint, solPrice, {
-            migratedAt: migrationDate,
+        console.log(`[gRPC-Bot] Profiling matrix profiles for ${uniqueWallets.size} wallets...`);
+        const walletArray = Array.from(uniqueWallets);
+        for (const walletAddress of walletArray) {
+          const allWalletTrades = await prisma.trade.findMany({
+            where: { wallet: walletAddress },
+          });
+          const allWalletEarlyBuys = await prisma.earlyBuyer.findMany({
+            where: { wallet: walletAddress },
           });
 
-          const uniqueWallets = new Set<string>();
+          const formattedTrades = allWalletTrades.map((t: any) => ({
+            id: t.id,
+            mint: t.mint,
+            wallet: t.wallet,
+            type: t.type,
+            solAmount: t.solAmount,
+            tokenAmount: t.tokenAmount,
+            priceUsd: t.priceUsd ?? null,
+            signature: t.signature,
+            timestamp: typeof t.timestamp === 'string' ? t.timestamp : t.timestamp.toISOString(),
+            slot: t.slot ? Number(t.slot) : null,
+          }));
 
-          // 3. Automatically persist historical trades and early buyers to DB
-          // 3. Automatically persist historical trades and early buyers to DB
-          for (let j = 0; j < earlyCurveBuys.length; j++) {
-            const buy = earlyCurveBuys[j];
-            uniqueWallets.add(buy.wallet);
+          const formattedEarlyBuys = allWalletEarlyBuys.map((b: any) => ({
+            id: b.id,
+            mint: b.mint,
+            wallet: b.wallet,
+            buyAmountSol: b.buyAmountSol,
+            buyAmountUsd: b.buyAmountUsd ?? null,
+            marketCapAtBuy: b.marketCapAtBuy ?? null,
+            isEarly: b.isEarly,
+            rank: b.rank ?? null,
+          }));
 
-            // 🟢 ADD THIS BLOCK HERE TO ENSURE THE WALLET EXISTS IN DB FIRST
-            await prisma.wallet.upsert({
-              where: { address: buy.wallet },
-              update: {},
-              create: {
-                address: buy.wallet,
-                score: 0,
-                tier: 'UNKNOWN',
-              },
-            });
+          const history = buildWalletHistoryFromTrades(walletAddress, formattedTrades, formattedEarlyBuys);
+          const scoreResult = scoreWallet(history);
 
-            // Your existing code remains completely unchanged below this line:
-            await prisma.trade.upsert({
-              where: { signature: buy.signature },
-              update: {},
-              create: {
-                mint: migration.mint,
-                wallet: buy.wallet,
-                type: 'BUY',
-                solAmount: buy.solAmount,
-                tokenAmount: buy.tokenAmount,
-                signature: buy.signature,
-                timestamp: new Date(buy.timestamp),
-              },
-            });
-
-            await prisma.earlyBuyer.upsert({
-              where: {
-                mint_wallet: {
-                  mint: migration.mint,
-                  wallet: buy.wallet,
-                },
-              },
-              update: {
-                isEarly: true,
-                buyAmountSol: buy.solAmount,
-              },
-              create: {
-                mint: migration.mint,
-                wallet: buy.wallet,
-                buyAmountSol: buy.solAmount,
-                buyAmountUsd: buy.solAmount * solPrice,
-                isEarly: true,
-              },
-            });
-          }
-
-          // 4. Process performance scores for every unique buyer automatically
-          console.log(`[Auto-Bot] Analyzing & updating profiles for ${uniqueWallets.size} wallets...`);
-          
-          // 🟢 Added async modifier and fixed the closing syntax at the bottom
-          uniqueWallets.forEach(async (walletAddress) => {
-            const allWalletTrades = await prisma.trade.findMany({
-              where: { wallet: walletAddress },
-            });
-            const allWalletEarlyBuys = await prisma.earlyBuyer.findMany({
-              where: { wallet: walletAddress },
-            });
-
-            // Re-format database elements to fit standard WalletHistory structure
-            const formattedTrades = allWalletTrades.map((t: any) => ({
-              id: t.id,
-              mint: t.mint,
-              wallet: t.wallet,
-              type: t.type as 'BUY' | 'SELL',
-              solAmount: t.solAmount,
-              tokenAmount: t.tokenAmount,
-              priceUsd: t.priceUsd ?? null,
-              signature: t.signature,
-              timestamp: t.timestamp.toISOString(),
-              slot: t.slot ? Number(t.slot) : null,
-            }));
-
-            const formattedEarlyBuys = allWalletEarlyBuys.map((b: any) => ({
-              id: b.id,
-              mint: b.mint,
-              wallet: b.wallet,
-              buyAmountSol: b.buyAmountSol,
-              buyAmountUsd: b.buyAmountUsd ?? null,
-              marketCapAtBuy: b.marketCapAtBuy ?? null,
-              isEarly: b.isEarly,
-              rank: b.rank ?? null,
-            }));
-
-            const history = buildWalletHistoryFromTrades(walletAddress, formattedTrades, formattedEarlyBuys);
-            const scoreResult = scoreWallet(history);
-
-            // Save/Update the global Wallet Score matrix
-            await prisma.wallet.upsert({
-              where: { address: walletAddress },
-              update: {
-                score: scoreResult.score,
-                tier: scoreResult.tier,
-                earlyBuyCount: scoreResult.earlyBuyCount,
-                winRate: scoreResult.winRate,
-                avgMultiple: scoreResult.avgMultiple,
-                totalPnlSol: scoreResult.totalPnlSol,
-                lastActive: scoreResult.lastActive ? new Date(scoreResult.lastActive) : null,
-                labelled: scoreResult.labelled,
-                totalTrades: scoreResult.totalTrades,
-              },
-              create: {
-                address: walletAddress,
-                score: scoreResult.score,
-                tier: scoreResult.tier,
-                earlyBuyCount: scoreResult.earlyBuyCount,
-                winRate: scoreResult.winRate,
-                avgMultiple: scoreResult.avgMultiple,
-                totalPnlSol: scoreResult.totalPnlSol,
-                lastActive: scoreResult.lastActive ? new Date(scoreResult.lastActive) : null,
-                labelled: scoreResult.labelled,
-                totalTrades: scoreResult.totalTrades,
-              },
-            });
-          }); // 🟢 Fixed: properly closing with }); instead of just }
-
-// Push new updates downstream into live view
-broadcastSSE({
-  type: 'NEW_MIGRATION',
-  data: {
-    id: migration.signature,
-    mint: migration.mint,
-    name: meta.name,
-    symbol: meta.symbol,
-    image: meta.image, 
-    migrationTxSig: migration.signature,
-    migratedAt: migrationDate.toISOString(),
-    marketCapAtMigration: null,
-    currentMarketCap: null,
-    raydiumPoolId: null,
-  }, // 🟢 Clean and type-safe without hacks
-  timestamp: Date.now(),
-});
-
-          lastSeenSignatures.add(migration.signature);
+          await prisma.wallet.upsert({
+            where: { address: walletAddress },
+            update: {
+              score: scoreResult.score,
+              tier: scoreResult.tier,
+              earlyBuyCount: scoreResult.earlyBuyCount,
+              winRate: scoreResult.winRate,
+              avgMultiple: scoreResult.avgMultiple,
+              totalPnlSol: scoreResult.totalPnlSol,
+              lastActive: scoreResult.lastActive ? new Date(scoreResult.lastActive) : null,
+              labelled: scoreResult.labelled,
+              totalTrades: scoreResult.totalTrades,
+            },
+            create: {
+              address: walletAddress,
+              score: scoreResult.score,
+              tier: scoreResult.tier,
+              earlyBuyCount: scoreResult.earlyBuyCount,
+              winRate: scoreResult.winRate,
+              avgMultiple: scoreResult.avgMultiple,
+              totalPnlSol: scoreResult.totalPnlSol,
+              lastActive: scoreResult.lastActive ? new Date(scoreResult.lastActive) : null,
+              labelled: scoreResult.labelled,
+              totalTrades: scoreResult.totalTrades,
+            },
+          });
         }
 
-        // Keep set from growing too large
-        if (lastSeenSignatures.size > 500) {
-          const arr = Array.from(lastSeenSignatures);
-          lastSeenSignatures = new Set(arr.slice(-200));
-        }
+        broadcastSSE({
+          type: 'NEW_MIGRATION',
+          data: {
+            id: migration.signature,
+            mint: migration.mint,
+            name: meta.name,
+            symbol: meta.symbol,
+            image: meta.image, 
+            migrationTxSig: migration.signature,
+            migratedAt: migrationDate.toISOString(),
+            marketCapAtMigration: null,
+            currentMarketCap: null,
+            raydiumPoolId: null,
+          },
+          timestamp: Date.now(),
+        });
+
+        lastSeenSignatures.add(migration.signature);
+      }
+
+      if (lastSeenSignatures.size > 500) {
+        const arr = Array.from(lastSeenSignatures);
+        lastSeenSignatures = new Set(arr.slice(-200));
       }
     } catch (err) {
-      console.error('SSE polling error:', err);
+      console.error('gRPC stream processor error:', err);
     }
-  }, 300_000); // Polling interval set to 5 minutes
+  });
+
+  stream.on("error", (err) => {
+    console.error("gRPC Stream dropped, re-establishing worker instance...", err);
+    isGrpcActive = false;
+    setTimeout(startGrpcStream, 5000); 
+  });
 }
 
 export async function GET(req: NextRequest) {
   const stream = new ReadableStream({
     start(controller) {
       clients.add(controller);
-      startPolling();
+      startGrpcStream(); // Canlı gRPC akışını tetikler
 
-      // Send initial heartbeat
+      // İlk bağlantı için heartbeat mesajı gönder
       const heartbeat: SSEMessage = {
         type: 'HEARTBEAT',
         data: null,
@@ -263,15 +290,9 @@ export async function GET(req: NextRequest) {
         new TextEncoder().encode(`data: ${JSON.stringify(heartbeat)}\n\n`)
       );
 
-      // Cleanup on client disconnect
+      // Tarayıcı sekmesi kapatıldığında istemciyi listeden temizle
       req.signal.addEventListener('abort', () => {
         clients.delete(controller);
-        
-        if (clients.size === 0 && pollingInterval) {
-          clearInterval(pollingInterval);
-          pollingInterval = null;
-        }
-        
         try {
           controller.close();
         } catch {}

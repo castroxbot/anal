@@ -174,40 +174,60 @@ export interface EarlyBuyerResult {
 }
 
 /** Walk bonding-curve buys in time order; flag wallets that bought below $15k mcap */
+// 🟢 Update your EarlyBuyerResult interface and detectEarlyBuyers function:
+export interface EarlyBuyerResult {
+  wallet: string;
+  solAmount: number;
+  rank: number;
+  marketCapAtBuy: number;
+  soldAmountSol: number;
+  realizedPnlSol: number;
+  hasSold: boolean;
+  lastSoldAt: Date | null;
+}
+
 export function detectEarlyBuyers(
-  buyTrades: Array<{ wallet: string; solAmount: number; tokenAmount: number; timestamp: Date }>,
+  trades: ParsedPumpTrade[],
   solPriceUsd: number
 ): EarlyBuyerResult[] {
-  const sorted = [...buyTrades].sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+  // Sort chronologically
+  const sorted = [...trades].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
-  let virtualSol = INITIAL_VIRTUAL_SOL_LAMPORTS;
-  let virtualToken = INITIAL_VIRTUAL_TOKEN_RAW;
-  const earlyBuyers: EarlyBuyerResult[] = [];
+  const earlyBuyersMap = new Map<string, EarlyBuyerResult>();
   const seenWallets = new Set<string>();
+  let earlyBuyerRank = 1;
 
-  for (let i = 0; i < sorted.length; i++) {
-    const trade = sorted[i];
-    const mcapAtBuy = marketCapUsdFromReserves(virtualSol, virtualToken, solPriceUsd);
+  for (const trade of sorted) {
+    const mcapAtTrade = (trade as any).mcapAtTrade || EARLY_BUY_THRESHOLD_USD;
+    const isAlreadyFlagged = earlyBuyersMap.has(trade.wallet);
 
-    if (mcapAtBuy < EARLY_BUY_THRESHOLD_USD && !seenWallets.has(trade.wallet)) {
+    // 1. Capture the initial buy entry point
+    if (trade.type === 'BUY' && mcapAtTrade < EARLY_BUY_THRESHOLD_USD && !seenWallets.has(trade.wallet)) {
       seenWallets.add(trade.wallet);
-      earlyBuyers.push({
+      earlyBuyersMap.set(trade.wallet, {
         wallet: trade.wallet,
         solAmount: trade.solAmount,
-        rank: earlyBuyers.length + 1,
-        marketCapAtBuy: mcapAtBuy,
+        rank: earlyBuyerRank++,
+        marketCapAtBuy: mcapAtTrade,
+        soldAmountSol: 0,
+        realizedPnlSol: 0,
+        hasSold: false,
+        lastSoldAt: null,
       });
     }
 
-    const solLamports = BigInt(Math.round(trade.solAmount * 1e9));
-    const tokensRaw = BigInt(Math.round(trade.tokenAmount * 10 ** TOKEN_DECIMALS));
-    ({ virtualSolLamports: virtualSol, virtualTokenRaw: virtualToken } = applyBuyToReserves(
-      virtualSol,
-      virtualToken,
-      solLamports,
-      tokensRaw
-    ));
+    else if (trade.type === 'BUY' && isAlreadyFlagged) {
+      const buyerData = earlyBuyersMap.get(trade.wallet)!;
+      buyerData.solAmount += trade.solAmount;
+    }
+    else if (trade.type === 'SELL' && isAlreadyFlagged) {
+      const buyerData = earlyBuyersMap.get(trade.wallet)!;
+      buyerData.soldAmountSol += trade.solAmount;
+      buyerData.realizedPnlSol = buyerData.soldAmountSol - buyerData.solAmount;
+      buyerData.hasSold = true;
+      buyerData.lastSoldAt = new Date(trade.timestamp);
+    }
   }
 
-  return earlyBuyers;
+  return Array.from(earlyBuyersMap.values());
 }

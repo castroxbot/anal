@@ -42,7 +42,8 @@ model Trade {
   slot        BigInt?
   createdAt   DateTime @default(now())
 
-  coin        MigratedCoin @relation(fields: [mint], references: [mint])
+  // 🟢 Updated: Added onDelete: Cascade
+  coin        MigratedCoin @relation(fields: [mint], references: [mint], onDelete: Cascade)
   wallet_ref  Wallet?      @relation(fields: [wallet], references: [address])
 
   @@index([mint])
@@ -51,18 +52,24 @@ model Trade {
 }
 
 model EarlyBuyer {
-  id            String   @id @default(cuid())
-  mint          String
-  wallet        String
-  buyAmountSol  Float
-  buyAmountUsd  Float?
-  marketCapAtBuy Float?
-  isEarly       Boolean  @default(false)  // bought < 15k mcap
-  rank          Int?     // buy order rank
-  createdAt     DateTime @default(now())
+  id              String   @id @default(cuid())
+  mint            String
+  wallet          String
+  buyAmountSol    Float
+  buyAmountUsd    Float?
+  marketCapAtBuy  Float?
+  isEarly         Boolean  @default(false)
+  rank            Int?
+  createdAt       DateTime @default(now())
 
-  coin          MigratedCoin @relation(fields: [mint], references: [mint])
-  wallet_ref    Wallet       @relation(fields: [wallet], references: [address])
+  // 🟢 Add these fields to handle sell calculations
+  soldAmountSol   Float    @default(0)
+  realizedPnlSol  Float    @default(0)
+  hasSold         Boolean  @default(false)
+  lastSoldAt      DateTime?
+
+  coin            MigratedCoin @relation(fields: [mint], references: [mint], onDelete: Cascade)
+  wallet_ref      Wallet       @relation(fields: [wallet], references: [address])
 
   @@unique([mint, wallet])
   @@index([mint])

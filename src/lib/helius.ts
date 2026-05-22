@@ -102,12 +102,15 @@ export async function getTokenMetadata(mints: string[]): Promise<HeliusTokenMeta
   const json = await res.json();
   if (json.error) throw new Error(`Helius DAS error: ${json.error.message}`);
 
+  // Inside getTokenMetadata map block:
   return (json.result || []).map((asset: any) => ({
     mint: asset.id,
     name: asset.content?.metadata?.name || 'Unknown',
     symbol: asset.content?.metadata?.symbol || '???',
     description: asset.content?.metadata?.description,
     image: asset.content?.links?.image,
+    // 🟢 Added line: Detect Mayhem Mode via the Token-2022 program address
+    isMayhem: asset.token_info?.token_program === 'TokenzQdBNbLqP5PP689lk8x9aJg1wB7GYZwRVw5Yp', 
   }));
 }
 
